@@ -40,15 +40,8 @@ library("Matrix")
 #| echo: true
 
 # load data
-load("house_sales_data.Rdata")
-load("house_sales_pred.Rdata")
-
-# rename data frames
-data_sold <- data_clean
-data_new <- data_pred
-
-# remove data frames with old names from the global environment
-rm(data_clean, data_pred)
+data_sold <- read.csv("data_sold_houses.csv")
+data_new <- read.csv("data_new_houses.csv")
 
 # check if there are any missing values
 all(is.na(data_sold))
