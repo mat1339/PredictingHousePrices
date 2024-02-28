@@ -1,0 +1,545 @@
+---
+title: "Predicting Sale Prices of New Houses"
+date: "2024-02-27"
+author: "Matthias Lukosch"
+format: html
+toc: true
+toc-depth: 2
+cap-location: "top"
+---
+
+
+```{r}
+#| label: packages
+#| include: false
+
+# load packages
+library("data.table")
+library("tidyverse")
+library("lubridate")
+library("readr")
+library("zoo")
+library("ggplot2")
+library("gridExtra")
+library("plotly")
+library("caret")
+library("grf")
+library("glmnet")
+library("DiagrammeR")
+library("Matrix")
+
+```
+
+
+
+# Data Preparation
+
+```{r}
+#| label: data preparation
+#| include: true
+#| echo: true
+
+# load data
+load("house_sales_data.Rdata")
+load("house_sales_pred.Rdata")
+
+# rename data frames
+data_sold <- data_clean
+data_new <- data_pred
+
+# remove data frames with old names from the global environment
+rm(data_clean, data_pred)
+
+# check if there are any missing values
+all(is.na(data_sold))
+all(is.na(data_new))
+
+# find the column SalePrice
+grep("SalePrice", names(data_sold))
+
+# move the SalePrice data from column 55 to the second column for convenience
+data_sold <- select(data_sold, 
+                    Id, 
+                    SalePrice, 
+                    everything())
+
+
+# generate some basic statistics of SalePrice data
+summary(data_sold[,c("SalePrice")])
+
+```
+
+
+## Visualization of Sale Prices
+
+```{r}
+#| label: SalePrice visualization
+#| include: true
+#| echo: false
+
+# illustrate the distribution of SalePrice (right-skewed)
+data_sold %>%
+    ggplot(aes(x = SalePrice)) + 
+    geom_histogram(binwidth = 10000, 
+                color = "black", 
+                fill = "darkblue") + 
+    geom_vline(aes(xintercept = mean(SalePrice)), 
+               color = "red", 
+               linetype = "dashed", 
+               linewidth = 0.8) +
+  labs(title = "Histogram of Sale Prices",
+       x = " Sale Price",
+       y = "Frequency") + 
+  scale_x_continuous(breaks = seq(0, 800000, by = 100000),) +
+  theme_minimal()
+
+
+```
+
+The distribution of sale prices is right-skewed, which means that the majority of the houses were sold for less than the mean sale price. 
+
+## Logarithmic Transformation
+
+```{r}
+#| label: create log(SalePrice)
+#| include: true
+#| echo: true
+
+# create another data frame with ln(SalePrice)
+log_data_sold <- data_sold %>%
+                    mutate(logSalePrice = log(SalePrice)) %>% # add log(SalePrice) as column
+                    select(Id, logSalePrice, everything()) %>% # move the generated data to column 2
+                    select(-c(SalePrice)) # drop SalePrice column                     
+
+
+# get some basic statistics of log(SalePrice)
+summary(log_data_sold[,c("logSalePrice")])
+
+```
+
+
+```{r}
+#| label: log(SalePrice) visualization
+#| include: true
+#| echo: false
+
+# illustrate the distribution of log(SalePrice) (approximately normal)
+log_data_sold %>%
+    ggplot(aes(x = logSalePrice)) + 
+    geom_histogram(binwidth = 0.2, 
+                color = "black", 
+                fill = "darkblue") +
+    geom_vline(aes(xintercept = mean(logSalePrice)),
+                color = "red", 
+                linetype = "dashed", 
+                linewidth = 0.8) +
+    labs(title = "Histogram of log Sale Prices",
+       x = " log Sale Price", 
+       y = "Frequency") + 
+    scale_x_continuous(breaks = seq(10, 14, by = 0.5),) + 
+    theme_minimal()
+
+```
+
+
+The distribution of log(SalePrice) is approximately normal.
+
+
+
+```{r}
+#| label: covariates
+#| include: true
+#| echo: true
+
+# save predictors as matrix
+covariates_sold <- as.matrix(data_sold[, c(3:ncol(data_sold))])
+covariates_new <- as.matrix(data_new[, c(2:ncol(data_new))])
+
+# check for multicollinearity
+comboInfo_sold <- findLinearCombos(covariates_sold)
+comboInfo_new <- findLinearCombos(covariates_new)
+
+dim(covariates_sold)[2] # number of predictors
+rankMatrix(covariates_sold) # should have full rank
+rankMatrix(covariates_new) # should have full rank
+
+covariates_sold <- covariates_sold[, -comboInfo_sold$remove] # remove multicollinearity
+covariates_new <- covariates_new[, -comboInfo_new$remove] # remove multicollinearity
+
+data_sold <- data_sold[, -comboInfo_sold$remove] # remove multicollinearity
+log_data_sold <- log_data_sold[, -comboInfo_sold$remove] # remove multicollinearity
+data_new <- data_new[, -comboInfo_new$remove] # remove multicollinearity
+
+dim(covariates_sold)[2] # number of predictors
+rankMatrix(covariates_sold) # check if matrix has full rank
+rankMatrix(covariates_new) # check if matrix has full rank
+
+
+# save dependent variable as matrix
+sale_price_sold <- as.matrix(data_sold[,c("SalePrice")])
+colnames(sale_price_sold) <- c("SalePrice") # rename column
+
+log_sale_price_sold <- as.matrix(log_data_sold[,c("logSalePrice")])
+colnames(log_sale_price_sold) <- c("logSalePrice") # rename column
+
+```
+
+
+```{r}
+#| label: train-test split
+#| include: true
+
+# divide the data into training set and hold-out sample
+set.seed(42) # for replicability
+
+idtrain <- sample(c(1:dim(data_sold)[1]),
+                  round(0.65*dim(data_sold)[1]))  # use 65% of the data for training purposes
+
+
+```
+
+
+# Model Building
+
+## OLS Regression
+
+```{r}
+#| label: OLS
+#| include: true
+#| echo: true
+#| warning: false
+
+# setting for 10 fold cross-validation
+train_control <- trainControl(method = "cv",
+                              number = 10)
+
+# OLS model with 10 fold cross-validation and SalePrice as dependent variable
+set.seed(42) # for replicability
+
+ln_model <- train(data = data_sold[idtrain,c(2:ncol(data_sold))],
+                  SalePrice ~ .,
+                  method = "lm",
+                  trControl = train_control)
+
+# prediction on hold-out sample
+fit_ln_model <- predict(ln_model,
+                        newdata = data_sold[-idtrain,c(2:ncol(data_sold))])
+
+# Assessment on hold-out sample
+SSR_ln_model <- sum((sale_price_sold[-idtrain,] - fit_ln_model)^2) # sum of squared residuals
+SST <- sum((sale_price_sold[-idtrain,] - mean(sale_price_sold[-idtrain,]))^2) # sum of squares total
+
+R2_ln_model <- 1- SSR_ln_model/SST # explained variation by the predictive model
+
+# print result
+print(paste("R2 of OLS model:", round(R2_ln_model,4)))
+
+# OLS model with 10 fold cross-validation and log(SalePrice) as dependent variable
+set.seed(42)
+
+log_ln_model <- train(data=log_data_sold[idtrain,c(2:ncol(log_data_sold))],
+                      logSalePrice ~ .,
+                      method = "lm", 
+                      trControl = train_control)
+
+# prediction on hold-out sample
+fit_log_ln_model <- predict(log_ln_model,
+                            newdata = log_data_sold[-idtrain,c(2:ncol(log_data_sold))])
+
+# Assessment on hold-out sample
+SSR_log_ln_model <- sum((log_sale_price_sold[-idtrain,] - fit_log_ln_model)^2) # sum of squared residuals
+SST_log <- sum((log_sale_price_sold[-idtrain,]- mean(log_sale_price_sold[-idtrain,]))^2) # sum of squares total
+
+R2_log_ln_model <- 1- SSR_log_ln_model/SST_log # explained variation by the predictive model
+
+# print result 
+print(paste("R2 of OLS model with log(SalePrice):", round(R2_log_ln_model,4)))
+
+```
+
+## Regularized Regression
+
+
+```{r}
+#| label: Regularized Regression
+#| include: true
+#| echo: true
+
+# Elastic Net regression with 10 fold cross-validation for a range of possible alpha values
+
+# grid of alpha values
+alpha <- seq(from = 0,
+            to = 1,
+            by = 0.05)
+
+# prepare matrix to store results
+elastic_net_alphas <- matrix(NA, 
+                            nrow = length(alpha),
+                            ncol = 2)
+
+colnames(elastic_net_alphas) <- c("Alpha Elastic Net",
+                                 "R^2 hold-out sample")
+
+# assign alpha values to matrix
+elastic_net_alphas[,1] <- alpha
+
+# for loop
+for (i in alpha) {
+  # elastic net regression
+  set.seed(42)
+  elastic_net <- cv.glmnet(covariates_sold[idtrain,], 
+                           sale_price_sold[idtrain,], 
+                           type.measure = "mse", 
+                           family = "gaussian", 
+                           alpha = i, 
+                           nfolds = 10)
+  
+  # prediction on hold-out sample
+  fit_elastic_net <- predict(elastic_net,
+                             newx = covariates_sold[-idtrain,],
+                             s = elastic_net$lambda.min)
+  
+  # store value of R2 in matrix
+  elastic_net_alphas[elastic_net_alphas[,1] == i, 2] <- 1 - sum((sale_price_sold[-idtrain,] - fit_elastic_net)^2)/SST
+  
+}
+
+# find alpha which maximizes hold-out sample R^2
+alpha_max <- elastic_net_alphas[which(elastic_net_alphas[,2] == max(elastic_net_alphas[,2])),]
+
+print("Alpha which maximizes hold-out sample R^2")
+print(alpha_max)
+
+
+# Elastic Net regression with 10 fold cross-validation and log(SalePrice) as dependent variable for a range of possible alpha values
+
+# use grid of alphas from above
+# prepare matrix
+log_elastic_net_alphas <- matrix(NA, 
+                                nrow = length(alpha), 
+                                ncol = 2)
+
+colnames(log_elastic_net_alphas) <- c("Alpha log Elastic Net",
+                                     "R^2 hold-out sample")
+
+# assign alpha values to matrix
+log_elastic_net_alphas[,1] <- alpha
+
+# for loop
+for (i in alpha) {
+  # elastic net regression
+  set.seed(42)
+  log_elastic_net <- cv.glmnet(covariates_sold[idtrain,],
+                               log_sale_price_sold[idtrain,], 
+                               type.measure = "mse", 
+                               family = "gaussian", 
+                               alpha = i, 
+                               nfolds = 10)
+  
+  # prediction on hold-out sample
+  fit_log_elastic_net <- predict(log_elastic_net, 
+                                 newx = covariates_sold[-idtrain,], 
+                                 s = log_elastic_net$lambda.min)
+  
+  # store value of R2 in matrix
+  log_elastic_net_alphas[log_elastic_net_alphas[,1] == i, 2] <- 1 - sum((log_sale_price_sold[-idtrain,] - fit_log_elastic_net)^2)/SST_log
+  
+}
+
+# find alpha which maximizes hold-out sample R^2
+log_alpha_max <- log_elastic_net_alphas[which(log_elastic_net_alphas[,2] == max(log_elastic_net_alphas[,2])),]
+
+print("Alpha which maximizes hold-out sample R^2")
+print(log_alpha_max)
+
+```
+
+
+## Random Forest
+
+
+```{r}
+#| label: Random Forest
+#| include: true
+#| echo: true
+
+
+# Random Forest with different number of trees and minimum observations in terminal leaves
+# specify a grid for the number of trees
+ntrees <- c(1,2,3,4,5,10,50,100,500,1000,5000,10000,15000)
+# specify a grid for the min observations in the terminal leaves 
+min_obs <- c(400,300,200,100,50,30,20,10,5)
+
+# specify remaining parameters
+ncov <- round(sqrt(ncol(covariates_sold)))
+frac <- 1/2
+
+# prepare matrix to store results
+forests_ntrees <- matrix(NA, nrow = length(ntrees), ncol = length(min_obs))
+
+# row names indicate number of trees used in the random forest
+rownames(forests_ntrees) <- ntrees
+
+# column names indicate number of min observations in terminal leaves
+colnames(forests_ntrees) <- min_obs
+
+# for loops
+for (j in min_obs) {
+
+for (i in ntrees) {
+  # build forest
+  set.seed(42)
+  forest <- regression_forest(covariates_sold[idtrain,],
+                              sale_price_sold[idtrain,], 
+                              num.trees = i,
+                              sample.fraction = frac, 
+                              mtry = ncov, 
+                              min.node.size = j, 
+                              honesty = FALSE)
+  
+  
+  # prediction on hold-out sample
+  fit_forest <- predict(forest, newdata = covariates_sold[-idtrain,])$predictions
+  
+  # store value of R^2 into matrix
+  forests_ntrees[rownames(forests_ntrees) == i , colnames(forests_ntrees) == j] <- 1 - sum((sale_price_sold[-idtrain,] - fit_forest)^2)/SST
+}
+}
+
+max_forest <- max(forests_ntrees)
+max_forest_index <- which(forests_ntrees == max_forest, arr.ind = TRUE)
+
+print("Maximum R^2")
+print(max_forest)
+
+
+# Random Forests with different number of trees and minimum observation in terminal leaves and with log(SalePrice) as dependent variable
+log_forests_ntrees <- matrix(NA, nrow = length(ntrees), ncol = length(min_obs))
+
+# row names indicate number of trees used in the random forest
+rownames(log_forests_ntrees) <- ntrees
+
+# column names indicate minimum observations in the terminal leaves
+colnames(log_forests_ntrees) <- min_obs
+
+# for loops
+for (j in min_obs) {
+  
+for (i in ntrees) {
+  # build forest
+  set.seed(42)
+  log_forest <- regression_forest(covariates_sold[idtrain,],
+                                  log_sale_price_sold[idtrain,], 
+                                  num.trees = i, 
+                                  sample.fraction = frac, 
+                                  mtry = ncov, 
+                                  min.node.size = j, 
+                                  honesty = FALSE)
+  
+  # prediction on hold-out sample
+  fit_log_forest <- predict(log_forest, newdata = covariates_sold[-idtrain,])$predictions
+  
+  # store value of R^2 into matrix
+  log_forests_ntrees[rownames(log_forests_ntrees) == i , colnames(log_forests_ntrees) == j] <- 1 - sum((log_sale_price_sold[-idtrain,] - fit_log_forest)^2)/SST_log
+}
+}
+
+max_log_forest <- max(log_forests_ntrees)
+max_log_forest_index <- which(log_forests_ntrees == max_log_forest, arr.ind = TRUE)
+
+print("Maximum R^2")
+print(max_log_forest)
+
+
+```
+
+
+
+# Model Comparison
+
+
+```{r}
+#| label: model comparison
+#| include: true
+
+# create summary data frame
+R2_overview <- data.frame(Model = (c("OLS","Log OLS",
+                                     "Elastic Net", 
+                                     "Log Elastic Net",
+                                     "Ridge",
+                                     "Log Ridge",
+                                     "Lasso",
+                                     "Log Lasso", 
+                                     "Forest", 
+                                     "Log Forest")), 
+                          R2 = c(R2_ln_model,
+                                 R2_log_ln_model,
+                                 elastic_net_alphas[5,2],
+                                 log_elastic_net_alphas[5,2],
+                                 elastic_net_alphas[1,2], 
+                                 log_elastic_net_alphas[1,2], 
+                                 elastic_net_alphas[21,2],
+                                 log_elastic_net_alphas[21,2], 
+                                 forests_ntrees[12,9], 
+                                 log_forests_ntrees[12,9])) 
+
+
+# print result
+print(R2_overview)
+
+```
+
+
+## Prediction of Sale Prices of New Houses
+
+Based on the results of the model comparison, I use the elastic net regression with log(SalePrice) as dependent variable to predict the sale prices of new houses. 
+
+```{r}
+#| label: prediction
+#| include: true
+#| echo: true
+
+# prediction of sale prices of new houses
+set.seed(42) # for replicability
+log_elastic_net <- cv.glmnet(covariates_sold[idtrain,],
+                             log_sale_price_sold[idtrain,],
+                             type.measure = "mse", 
+                             family = "gaussian", 
+                             alpha = 0.2, 
+                             nfolds = 10)
+
+fit_log_elastic_net <- predict(log_elastic_net,
+                               newx = covariates_new, 
+                               s = log_elastic_net$lambda.min)
+
+
+# re-transform data
+fit <- exp(fit_log_elastic_net)
+colnames(fit) <- c("Predicted Sale Price")
+
+```
+
+
+
+
+```{r}
+#| label: store results
+#| include: true
+
+results <- data.frame(Id = data_new$Id,
+                      SalePrice = fit)
+
+
+colnames(results) <- c("Id", "PrecitedSalePrice")
+rownames(results) <- seq(1, nrow(results), by = 1)
+
+
+# last check
+summary(results[,c("PrecitedSalePrice")])
+summary(data_sold[,c("SalePrice")])
+
+
+# write csv
+write.csv(results, "predicted_sale_prices.csv", row.names = FALSE)
+
+```
