@@ -1,0 +1,2 @@
+# Mark a specific file as detectable
+*.qmd linguist-detectable=true
